@@ -2,3 +2,4 @@
 Codes for mass chip QA
 
 - Feb. 17, 2026: 1st commit
+- Mar. 26, 1st: prepare for base fw update
