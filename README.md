@@ -3,10 +3,10 @@ Codes for mass chip QA
 
 - Feb. 17, 2026: 1st commit
 - Mar. 26, 2026: Base fw updated
-- Apr. 1st, 2026:\
+- Apr. 1st, 2026:
 	1. Remarks:\
 		a. Base QA framework is completed and tested; Base fw: A-STEP\
-		b. The codes are written with AI assistance: they'll be cleaned up later\
+		b. The codes are written with AI assistance: they'll be cleaned up later
 	2. Structure:\
 		a. v3/config.py:     only true source for the chip configuration\
 		b. v3/protocol.py:   generate SR bitstream and SPI frame\
