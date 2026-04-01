@@ -24,14 +24,18 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import csv
 import json
 import logging
+import math
 import os
 import subprocess
 import sys
 import time
 import traceback
+
 from pathlib import Path
+from statistics import mean, median
 from typing import Any
 
 # Make sibling imports work when running the script directly.
@@ -96,23 +100,23 @@ def run_external_decoder(bin_path: Path) -> None:
 
 def summarize_run(run: DAQRunResult) -> dict[str, Any]:
 	return {
-		"lanes":        run.lanes,
-		"t_start":      run.t_start,
-		"t_end":        run.t_end,
+		"lanes":		run.lanes,
+		"t_start":		run.t_start,
+		"t_end":		run.t_end,
 		"duration_s":   run.t_end - run.t_start,
 		"total_chunks": run.total_chunks,
 		"total_bytes":  run.total_bytes,
 		"chunks": [
 			{
-				"lane":       c.lane,
-				"t_start":    c.t_start,
-				"t_end":      c.t_end,
+				"lane":		  c.lane,
+				"t_start":	  c.t_start,
+				"t_end":	  c.t_end,
 				"duration_s": c.t_end - c.t_start,
 				"irq_seen":   c.irq_seen,
-				"rounds":     c.rounds,
+				"rounds":	  c.rounds,
 				"bytes_written_as_dummy": c.bytes_written_as_dummy,
-				"buffer_sizes":           c.buffer_sizes,
-				"nbytes":                 c.nbytes,
+				"buffer_sizes":			  c.buffer_sizes,
+				"nbytes":				  c.nbytes,
 			}
 			for c in run.chunks
 		],
@@ -120,10 +124,10 @@ def summarize_run(run: DAQRunResult) -> dict[str, Any]:
 
 def summarize_check_result(result: QACheckResult) -> dict[str, Any]:
 	payload = {
-		"name"     : result.name,
-		"passed"   : result.passed,
-		"metrics"  : result.metrics,
-		"notes"    : result.notes,
+		"name":	  result.name,
+		"passed":	result.passed,
+		"metrics":   result.metrics,
+		"notes":	 result.notes,
 		"artifacts": {},
 	}
 
@@ -158,11 +162,207 @@ async def build_new_stack(arun: AstropixRun) -> tuple[V3Transport, V3Protocol, V
 		max_nchips = max(max_nchips, nchips)
 		lane_configs[lane] = V3Config.from_astep_asic_config(asic_obj.asic_config, nchips=nchips)
 
-	protocol   = V3Protocol(nchips=max_nchips)
+	protocol = V3Protocol(nchips=max_nchips)
 	controller = V3Controller(transport, protocol, lane_configs=lane_configs)
-	daq        = V3DAQ(controller, default_lane=min(lane_configs.keys()))
-	qa         = V3QA(controller, daq)
+	daq = V3DAQ(controller, default_lane=min(lane_configs.keys()))
+	qa = V3QA(controller, daq, legacy_arun=arun)
 	return transport, protocol, controller, daq, qa
+
+def _percentile(values: list[float], q: float) -> float | None:
+	if not values:
+		return None
+	xs = sorted(values)
+	if len(xs) == 1:
+		return float(xs[0])
+	pos = q * (len(xs) - 1)
+	lo = int(math.floor(pos))
+	hi = int(math.ceil(pos))
+	if lo == hi:
+		return float(xs[lo])
+	frac = pos - lo
+	return float(xs[lo] * (1.0 - frac) + xs[hi] * frac)
+
+def _safe_float(value: Any) -> float | None:
+	try:
+		if value is None or value == "": return None
+		return float(value)
+	except Exception:
+		return None
+
+def summarize_decoded_csv(csv_path: Path) -> dict[str, Any]:
+	rows: list[dict[str, Any]] = []
+	with csv_path.open("r", encoding="utf-8", newline="") as f:
+		reader = csv.DictReader(f)
+		for row in reader: rows.append(row)
+
+	out: dict[str, Any] = {"n_rows_total": len(rows), "csv_file": csv_path.name}
+	if not rows: return out
+
+	sample = rows[0]
+	iscol_key = next((k for k in ("isCol", "iscol", "is_col") if k in sample), None)
+	tot_key   = next((k for k in ("tot_total", "tot", "ToT", "ToT_total") if k in sample), None)
+	ts_key	= next((k for k in ("timestamp", "ts", "fpga_ts", "toa") if k in sample), None)
+
+	if ts_key is not None:
+		out["n_unique_timestamp"] = len({row[ts_key] for row in rows if row.get(ts_key) not in (None, "")})
+
+	if tot_key is not None:
+		tot_vals = [_safe_float(row.get(tot_key)) for row in rows]
+		tot_vals = [x for x in tot_vals if x is not None]
+		if tot_vals:
+			out["tot_key"] = tot_key
+			out["tot_mean"] = mean(tot_vals)
+			out["tot_median"] = median(tot_vals)
+			out["tot_q10"] = _percentile(tot_vals, 0.10)
+			out["tot_q90"] = _percentile(tot_vals, 0.90)
+
+	if iscol_key is not None:
+		out["iscol_key"] = iscol_key
+		for iscol_val, label in (("0", "row"), ("1", "col")):
+			sub = [row for row in rows if str(row.get(iscol_key, "")).strip() == iscol_val]
+			out[f"n_{label}"] = len(sub)
+
+			if tot_key is not None:
+				sub_tot = [_safe_float(row.get(tot_key)) for row in sub]
+				sub_tot = [x for x in sub_tot if x is not None]
+				if sub_tot:
+					out[f"{label}_tot_mean"] = mean(sub_tot)
+					out[f"{label}_tot_median"] = median(sub_tot)
+					out[f"{label}_tot_q10"] = _percentile(sub_tot, 0.10)
+					out[f"{label}_tot_q90"] = _percentile(sub_tot, 0.90)
+
+	return out
+
+def run_external_decoder(bin_path: Path) -> Path | None:
+	before = {p.resolve() for p in bin_path.parent.glob("*.csv")}
+	subprocess.run(["python3.12", "Quad_Chip_Decoder.py", "-b", "True", "-n", str(bin_path)], check=True)
+
+	preferred = bin_path.with_suffix(".csv")
+	if preferred.exists():
+		return preferred
+
+	after = [p.resolve() for p in bin_path.parent.glob("*.csv")]
+	new_csvs = [p for p in after if p not in before]
+	if new_csvs:
+		return max(new_csvs, key=lambda p: p.stat().st_mtime)
+
+	existing = list(bin_path.parent.glob("*.csv"))
+	if existing:
+		return max(existing, key=lambda p: p.stat().st_mtime)
+
+	return None
+
+def materialize_artifacts(
+	obj: Any,
+	*,
+	stage_dir: Path,
+	prefix: str,
+	extracted_runs: list[dict[str, Any]],
+) -> Any:
+	if isinstance(obj, DAQRunResult):
+		base = stage_dir / prefix
+		raw = flatten_run_raw(obj)
+		bin_path = base.with_suffix(".bin")
+		run_json_path = stage_dir / f"{base.name}_run.json"
+
+		bin_path.write_bytes(raw)
+		write_json(run_json_path, summarize_run(obj))
+
+		extracted_runs.append(
+			{
+				"prefix": prefix,
+				"bin_path": bin_path,
+				"run_json_path": run_json_path,
+				"run_summary": summarize_run(obj),
+			}
+		)
+
+		return {
+			"daq_run_prefix": prefix,
+			"bin_file": bin_path.name,
+			"run_json_file": run_json_path.name,
+			"run_summary": summarize_run(obj),
+		}
+
+	if isinstance(obj, dict):
+		return {
+			key: materialize_artifacts(
+				value,
+				stage_dir=stage_dir,
+				prefix=f"{prefix}_{key}",
+				extracted_runs=extracted_runs,
+			)
+			for key, value in obj.items()
+		}
+
+	if isinstance(obj, list):
+		return [
+			materialize_artifacts(
+				value,
+				stage_dir=stage_dir,
+				prefix=f"{prefix}_{idx:03d}",
+				extracted_runs=extracted_runs,
+			)
+			for idx, value in enumerate(obj)
+		]
+
+	return obj
+
+def summarize_check_result(
+		result: QACheckResult,
+		*,
+		stage_dir: Path
+)-> tuple[dict[str, Any], list[dict[str, Any]]]:
+	extracted_runs: list[dict[str, Any]] = []
+	artifacts = materialize_artifacts(
+		result.artifacts,
+		stage_dir=stage_dir,
+		prefix="artifact",
+		extracted_runs=extracted_runs,
+	)
+
+	payload = {
+		"name": result.name,
+		"passed": result.passed,
+		"metrics": result.metrics,
+		"notes": result.notes,
+		"artifacts": artifacts,
+	}
+	return payload, extracted_runs
+
+def assess_decoded_threshold_compare(compare_rows: list[dict[str, Any]]) -> dict[str, Any]:
+	thresholds: list[float] = []
+	decoded_total_hits: list[int] = []
+
+	for row in compare_rows:
+		ds = row.get("decoded_summary") or {}
+		thr = float(row["threshold_offset_mv"])
+
+		if "n_rows_total" in ds:
+			nhits = int(ds["n_rows_total"])
+		else:
+			nhits = int(ds.get("n_row", 0)) + int(ds.get("n_col", 0))
+
+		thresholds.append(thr)
+		decoded_total_hits.append(nhits)
+
+	out = {
+		"available": len(decoded_total_hits) >= 2,
+		"thresholds_mv": thresholds,
+		"decoded_total_hits": decoded_total_hits,
+		"lowest_threshold_hits": decoded_total_hits[0] if decoded_total_hits else None,
+		"highest_threshold_hits": decoded_total_hits[-1] if decoded_total_hits else None,
+		"monotonic_nonincreasing": (
+			all(decoded_total_hits[i + 1] <= decoded_total_hits[i]
+				for i in range(len(decoded_total_hits) - 1))
+			if len(decoded_total_hits) >= 2 else None
+		),
+		"passed": (
+			decoded_total_hits[-1] < decoded_total_hits[0]
+			if len(decoded_total_hits) >= 2 else False
+		),
+	}
+	return out
 
 async def run_stage(
 	*,
@@ -170,7 +370,7 @@ async def run_stage(
 	coro,
 	out_dir: Path,
 	stop_on_fail: bool,
-	run_ext_decoder: bool = False
+	run_ext_decoder: bool = False,
 ) -> tuple[bool, dict[str, Any] | None]:
 	stage_dir = out_dir / name
 	stage_dir.mkdir(parents=True, exist_ok=True)
@@ -180,25 +380,99 @@ async def run_stage(
 	try:
 		result = await coro
 		elapsed = time.time() - t0
-		summary = summarize_check_result(result)
-		summary["elapsed_s"] = elapsed
-		write_json(stage_dir / "result.json", summary)
 
-		# Save raw DAQ payloads when present.
-		for artifact_name, artifact in result.artifacts.items():
-			if isinstance(artifact, DAQRunResult):
-				raw = flatten_run_raw(artifact)
-				if raw:	(stage_dir / f"{artifact_name}.bin").write_bytes(raw)
-				write_json(stage_dir / f"{artifact_name}_run.json", summarize_run(artifact))
+		summary, extracted_runs = summarize_check_result(result, stage_dir=stage_dir)
+		summary["elapsed_s"] = elapsed
+
+		decoded_records: list[dict[str, Any]] = []
+
+		if run_ext_decoder:
+			for rec in extracted_runs:
+				bin_path = rec["bin_path"]
+				if not bin_path.exists():
+					continue
+
+				csv_path = run_external_decoder(bin_path)
+				decoded_summary = None
+				if csv_path is not None and csv_path.exists():
+					decoded_summary = summarize_decoded_csv(csv_path)
+					write_json(
+						stage_dir / f"{rec['prefix']}_decoded_summary.json",
+						decoded_summary,
+					)
+
+				decoded_records.append(
+					{
+						"prefix": rec["prefix"],
+						"bin_file": bin_path.name,
+						"csv_file": csv_path.name if csv_path is not None else None,
+						"decoded_summary": decoded_summary,
+					}
+				)
+
+			if decoded_records:
+				write_json(stage_dir / "decoded_runs.json", decoded_records)
+				summary["artifacts"]["decoded_runs_file"] = "decoded_runs.json"
+
+			# Special aggregate comparison for threshold scan
+			final_passed = result.passed
+
+			if result.name == "threshold_scan" and "scan_points" in result.artifacts:
+				compare_rows: list[dict[str, Any]] = []
+				raw_points = result.artifacts["scan_points"]
+
+				point_decoded = [
+					rec for rec in decoded_records
+					if "_scan_points_" in rec["prefix"] and rec["prefix"].endswith("_run")
+				]
+
+				for point, dec in zip(raw_points, point_decoded):
+					compare_rows.append(
+						{
+							"threshold_offset_mv": point["threshold_offset_mv"],
+							"threshold_apply_mode": point["threshold_apply_mode"],
+							"summary": point["summary"],
+							"decoded_summary": dec["decoded_summary"],
+							"csv_file": dec["csv_file"],
+							"bin_file": dec["bin_file"],
+						}
+					)
+
+				if compare_rows:
+					write_json(stage_dir / "decoded_compare.json", compare_rows)
+					summary["artifacts"]["decoded_compare_file"] = "decoded_compare.json"
+
+					decoded_eval = assess_decoded_threshold_compare(compare_rows)
+					write_json(stage_dir / "decoded_threshold_assessment.json", decoded_eval)
+					summary["artifacts"]["decoded_threshold_assessment_file"] = "decoded_threshold_assessment.json"
+
+					summary["metrics"]["decoded_thresholds_mv"] = decoded_eval["thresholds_mv"]
+					summary["metrics"]["decoded_total_hits"] = decoded_eval["decoded_total_hits"]
+
+					# Preserve coarse judgement for debugging, but use decoded judgement as final.
+					summary["metrics"]["coarse_passed"] = result.passed
+					final_passed = decoded_eval["passed"]
+					summary["passed"] = final_passed
+
+					if decoded_eval["available"]:
+						if final_passed:
+							summary["notes"].append(
+								"Decoded hit counts decrease with increasing threshold;\
+								threshold application appears effective."
+							)
+						else:
+							summary["notes"].append(
+								"Decoded hit counts do not decrease with increasing threshold."
+							)
+			else:
+				final_passed = result.passed
+
+		write_json(stage_dir / "result.json", summary)
 
 		logger.info("=== END %s | passed=%s | elapsed=%.3fs ===", name, result.passed, elapsed)
 
 		if stop_on_fail and result.passed is False:
 			raise V3QAStageFailure(f"Stage {name} returned passed=False")
-
-		if run_ext_decoder:
-			logger.info(f"%s: generating csv...", name)
-			run_external_decoder(stage_dir / "run.bin")
 
 		return True, summary
 
@@ -215,7 +489,8 @@ async def run_stage(
 		write_json(stage_dir / "error.json", error_payload)
 		write_text(stage_dir / "traceback.txt", tb)
 		logger.exception("=== FAIL %s | elapsed=%.3fs ===", name, elapsed)
-		if stop_on_fail: raise
+		if stop_on_fail:
+			raise
 		return False, error_payload
 
 class V3QAStageFailure(RuntimeError):
@@ -258,10 +533,10 @@ async def main(args: argparse.Namespace) -> int:
 		ok, payload = await run_stage(
 			name="01_smoke_test",
 			coro=qa.smoke_test(
-				lane              = args.lane,
-				first_chip_id     = args.first_chip_id,
-				autoread          = args.autoread,
-				reset_delay_s     = args.reset_delay_s,
+				lane			  = args.lane,
+				first_chip_id	 = args.first_chip_id,
+				autoread		  = args.autoread,
+				reset_delay_s	 = args.reset_delay_s,
 				flush_burst_bytes = args.flush_burst_bytes,
 				flush_max_rounds  = args.flush_max_rounds
 			),
@@ -274,77 +549,54 @@ async def main(args: argparse.Namespace) -> int:
 
 		# Stage 2: single-pixel injection
 		ok2, payload2 = await run_stage(
-			name="02_single_pixel_injection",
-			coro=qa.single_pixel_injection(
-				lane = args.lane,
-				chip = args.chip,
-				col  = args.col,
-				row  = args.row,
-				threshold_offset_mv  = args.threshold_offset_mv,
-				autoread             = args.autoread,
-				vinj_mv              = args.vinj_mv,
-				duration_s           = args.injection_duration_s,
-				injector_period      = args.injector_period,
-				injector_clkdiv      = args.injector_clkdiv,
-				injector_initdelay   = args.injector_initdelay,
-				injector_cycle       = args.injector_cycle,
-				injector_pulseperset = args.injector_pulseperset,
-				decoder = None
+			name="02_sparse_injection_test",
+			coro=qa.sparse_injection_test(
+				lane=args.lane,
+				chip=args.chip,
+				# pixels=... # submit default
+				threshold_mode=args.threshold_mode,
+				vinj_mv=args.vinj_mv,
+				injection_thr_mv=args.injection_thr_mv,
+				duration_s=args.injection_duration_s,
+				autoread=args.autoread,
+				injector_period=args.injector_period,
+				injector_clkdiv=args.injector_clkdiv,
+				injector_initdelay=args.injector_initdelay,
+				injector_cycle=args.injector_cycle,
+				injector_pulseperset=args.injector_pulseperset,
+				decoder=None,
 			),
 			out_dir=out_dir,
 			stop_on_fail=args.stop_on_fail,
 			run_ext_decoder=args.run_external_decoder
 		)
-		session_summary["stages"]["02_single_pixel_injection"] = payload2
+		session_summary["stages"]["02_sparse_injection_test"] = payload2
 
 		# ---------------------------------------
 
-		# Stage 3: threshold scan
+		# Stage 3: threshold scan vs. noise
+
 		threshold_offsets = [float(x) for x in args.threshold_scan_offsets_mv]
 		ok3, payload3 = await run_stage(
 			name="03_threshold_scan",
 			coro=qa.threshold_scan(
-				lane = args.lane,
-				chip = args.chip,
-				col  = args.col,
-				row  = args.row,
-				threshold_offsets_mv = threshold_offsets,
-				autoread             = args.autoread,
-				vinj_mv              = args.vinj_mv,
-				duration_s           = args.threshold_scan_duration_s,
-				injector_period      = args.injector_period,
-				injector_clkdiv      = args.injector_clkdiv,
-				injector_initdelay   = args.injector_initdelay,
-				injector_cycle       = args.injector_cycle,
-				injector_pulseperset = args.injector_pulseperset,
-				decoder = None
+				lane=args.lane,
+				chip=args.chip,
+				threshold_offsets_mv=threshold_offsets,
+				threshold_mode=args.threshold_mode,
+				duration_s=args.threshold_scan_duration_s,
+				autoread=args.autoread,
+				enable_full_matrix=True,
+				enable_pixels=None,
+				decoder=None,
 			),
 			out_dir=out_dir,
 			stop_on_fail=args.stop_on_fail,
+			run_ext_decoder=args.run_external_decoder
 		)
 		session_summary["stages"]["03_threshold_scan"] = payload3
 
 		# ---------------------------------------
-
-		"""
-		# Stage 4: noise occupancy/activity
-		ok4, payload4 = await run_stage(
-			name="04_noise_occupancy",
-			coro=qa.noise_occupancy(
-				lane=args.lane,
-				chip=args.chip,
-				duration_s=args.noise_duration_s,
-				threshold_offset_mv=args.threshold_offset_mv,
-				enable_full_matrix=args.noise_full_matrix,
-				enable_pixels=None,
-				autoread=args.autoread,
-				decoder=None
-			),
-			out_dir=out_dir,
-			stop_on_fail=args.stop_on_fail,
-		)
-		session_summary["stages"]["04_noise_occupancy"] = payload4
-		"""
 
 		session_summary["completed_at"] = time.time()
 		write_json(out_dir / "session_summary.json", session_summary)
@@ -372,8 +624,8 @@ def build_argparser() -> argparse.ArgumentParser:
 		formatter_class=argparse.ArgumentDefaultsHelpFormatter,
 	)
 
-	parser.add_argument("-x", "--fpgaxml",     type=str, default="gecco")
-	parser.add_argument("-y", "--yaml",        type=str, nargs="+", default=["singlechip_testconfig_v3"])
+	parser.add_argument("-x", "--fpgaxml",	 type=str, default="gecco")
+	parser.add_argument("-y", "--yaml",		type=str, nargs="+", default=["singlechip_testconfig_v3"])
 	parser.add_argument("-c", "--chipsPerRow", type=int, nargs="+", default=[1])
 
 	parser.add_argument("--lane", type=int, default=0)
@@ -382,18 +634,20 @@ def build_argparser() -> argparse.ArgumentParser:
 	parser.add_argument("--row",  type=int, default=10)
 	parser.add_argument("--first_chip_id", type=int, default=0)
 
-	parser.add_argument("--vinj_mv",              type=float, default=500.0)
-	parser.add_argument("--injection_duration_s", type=float, default=10.0)
-	parser.add_argument("--injector_period",      type=int, default=162)
-	parser.add_argument("--injector_clkdiv",      type=int, default=300)
+	parser.add_argument("--vinj_mv",			  type=float, default=500.0)
+	parser.add_argument("--injection_thr_mv",	 type=float, default=400.0)
+	parser.add_argument("--injection_duration_s", type=float, default=5.0)
+	parser.add_argument("--injector_period",	  type=int, default=162)
+	parser.add_argument("--injector_clkdiv",	  type=int, default=300)
 	parser.add_argument("--injector_initdelay",   type=int, default=100)
-	parser.add_argument("--injector_cycle",       type=int, default=0)
+	parser.add_argument("--injector_cycle",	   type=int, default=0)
 	parser.add_argument("--injector_pulseperset", type=int, default=1)
 
-	parser.add_argument("--threshold_offset_mv",       type=float, default=400.0)
-	parser.add_argument("--threshold_scan_duration_s", type=float, default=10.0)
-	parser.add_argument("--threshold_scan_offsets_mv", type=float, nargs="+",
-			default=[200.0, 250.0, 300.0, 350.0, 400.0, 450.0, 500.0]
+	parser.add_argument("--threshold_scan_duration_s", type=float, default=5.0)
+	parser.add_argument("--threshold_scan_offsets_mv", type=float, nargs="+", default=[50.0, 100.0, 150.0, 200.0])
+	parser.add_argument("--threshold_mode", type=str,
+			choices=["internal", "legacy_gecco_external"], default="legacy_gecco_external",
+			help="Which threshold path to scan"
 			)
 
 	parser.add_argument("--noise-duration-s", type=float, default=1.0)
