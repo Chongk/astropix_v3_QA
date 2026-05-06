@@ -1,5 +1,6 @@
 # - Mar. 24, 2026
 # - Chong Kim, ckim.phenix@gmail.com
+# - Written by AI assistance (chatGPT 5.4)
 
 from __future__ import annotations
 from copy import deepcopy

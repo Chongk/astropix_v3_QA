@@ -1,8 +1,12 @@
-# astropix_v3_QA
+# astropix\_v3\_QA
 Codes for mass chip QA
 
-- Feb. 17, 2026: 1st commit
-- Mar. 26, 2026: Base fw updated
+- May 6, 2026: cpp based decoding and analysis modules added:
+	1. decode:\
+		a. decode.h\
+		b. decode.cpp
+	2. analysis: qa\_ana.cpp
+
 - Apr. 1st, 2026:
 	1. Remarks:\
 		a. Base QA framework is completed and tested; Base fw: A-STEP\
@@ -16,3 +20,6 @@ Codes for mass chip QA
 		f. v3/qa.py:         QA routines\
 		g. v3_qa_run.py:     QA runner script
 
+- Mar. 26, 2026: Base fw updated
+
+- Feb. 17, 2026: 1st commit

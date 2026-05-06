@@ -1,5 +1,6 @@
 # - Mar. 24, 2026
 # - Chong Kim, ckim.phenix@gmail.com
+# - Written by AI assistance (chatGPT 5.4)
 
 from __future__ import annotations
 from copy import deepcopy
@@ -363,7 +364,6 @@ class V3Config:
 	def enable_pixel(self, chip: int, col: int, row: int) -> None:
 		"""
 		Enable comparator in one pixel.
-
 		Existing code uses:	word &= ~(2 << row), which means the disable bit is at position (row + 1)
 		"""
 		self._validate_chip(chip)
@@ -415,7 +415,6 @@ class V3Config:
 	def enable_injection_pixel(self, chip: int, col: int, row: int) -> None:
 		"""
 		High-level helper for the usual single-pixel injection use case
-
 		v3 architecture uses separated row/column injection control,
 		so a "pixel injection" means enabling both switches
 		"""
@@ -459,7 +458,6 @@ class V3Config:
 	def enable_ampout_col(self, chip: int, col: int) -> None:
 		"""
 		Select one column for analog mux output
-
 		Unlike the current helper, this really clears ampout on *all* columns first,
 		then enables it on the requested column
 		"""
