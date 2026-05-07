@@ -77,6 +77,8 @@ struct DecodeResult
     DecodeStats stats;
 };
 
+void decode(void) {} // Dummy function to suppress warning message
+
 bool extract_ll_field     (const std::string& obj, const std::string& key, long long& value);
 bool is_valid_astep_header(const vector<uint8_t>& data, size_t i, int astep_packet_size);
 bool load_readout_index   (const char* json_path, vector<ReadoutRange>& v_readout_ranges, bool verbose = false);
@@ -86,7 +88,6 @@ int listup_scan_index          (const std::string& file, const std::string& patt
 int lookup_readout_number      (size_t record_offset, const vector<ReadoutRange>& v_readout_ranges);
 vector<string> listup_bin_files(const char* path, bool verbose = false);
 
-vector<V3Hit> decode_astep_hits(const char* data_bin, bool use_readout_index = true, bool verbose = false);
 DecodeResult  decode_astep     (const char* data_bin, bool use_readout_index = true, bool verbose = false);
 
 #endif //DECODE_H

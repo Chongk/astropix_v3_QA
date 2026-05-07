@@ -153,12 +153,6 @@ vector<string> listup_bin_files(const char* path, bool verbose)
     return files;
 }//listup_bin_files
 
-// Compatibility helper if you only want the decoded hit vector
-vector<V3Hit> decode_astep_hits(const char* data_bin, bool use_readout_index, bool verbose)
-{
-    return decode_astep(data_bin, use_readout_index, verbose).hits;
-}//decode_astep_hits
-
 DecodeResult decode_astep(
     const char* data_bin,
     bool use_readout_index = true,
@@ -180,7 +174,7 @@ DecodeResult decode_astep(
     if (use_readout_index)
     {
 		string json_path_org = data_bin;
-		string json_path_prx = std::regex_replace(json_path_org, std::regex(".bin"), "_readout_index.json");
+		string json_path_prx = std::regex_replace(json_path_org, std::regex(R"(\.bin$)"), "_readout_index.json");
         result.stats.readout_index_loaded = load_readout_index(json_path_prx.c_str(), v_readout_ranges, verbose);
         result.stats.readout_ranges_loaded = v_readout_ranges.size();
     }
@@ -271,9 +265,3 @@ DecodeResult decode_astep(
 
     return result;
 }//decode_astep
-
-void decode(void)
-{
-	// Dummy function to suppress warning message - don't bother
-	return;
-}//decode

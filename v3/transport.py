@@ -176,30 +176,37 @@ class V3Transport:
 		await self._call("deassert SPI chip select", self.board.layersDeselectSPI(flush=flush))
 
 	async def enable_readout(self, *, autoread: bool = True, flush: bool = True) -> None:
+		"""
+		Enable layer readout while preserving the caller's intent.
+
+		We try a small set of known boardDriver signatures and only fall through on
+		TypeError/AttributeError (signature mismatch). Any transport/runtime failure
+		from a matching signature is propagated.
+		"""
 		lanes = self.lanes
-		try:
-			await self._call("enable readout", self.board.enableLayersReadout(autoread, flush))
-			return
-		except V3TransportError as exc:
-			if not isinstance(exc, V3TransportFatalError):
-				pass
-			else:
+		attempts = [
+			("enable readout", lambda: self.board.enableLayersReadout(autoread=autoread, flush=flush)),
+			("enable readout", lambda: self.board.enableLayersReadout(autoread, flush)),
+			("enable readout", lambda: self.board.enableLayersReadout(lanes, autoread, flush)),
+			("enable readout", lambda: self.board.enableLayersReadout(lanes=lanes, autoread=autoread, flush=flush)),
+		]
+		signature_errors: list[str] = []
+		for action, thunk in attempts:
+			try:
+				await self._call(action, thunk())
+				return
+			except V3TransportFatalError:
 				raise
-		except Exception:
-			pass
-
-		try:
-			await self._call("enable readout", self.board.enableLayersReadout(lanes, autoread, flush))
-			return
-		except V3TransportError as exc:
-			if not isinstance(exc, V3TransportFatalError):
-				pass
-			else:
+			except V3TransportError:
 				raise
-		except Exception:
-			pass
+			except (TypeError, AttributeError) as exc:
+				signature_errors.append(str(exc))
+				continue
 
-		await self._call("enable readout", self.board.enableLayersReadout())
+		raise V3TransportError(
+				"Could not find a supported enableLayersReadout signature on the board driver. "
+				f"Tried {len(attempts)} variants; last signature error: {signature_errors[-1] if signature_errors else 'n/a'}"
+			)
 
 	async def disable_readout(self, flush: bool = True) -> None:
 		await self._call("disable readout", self.board.disableLayersReadout(flush))

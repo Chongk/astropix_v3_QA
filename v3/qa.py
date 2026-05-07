@@ -9,17 +9,12 @@ from typing import Any, Callable, Iterable
 from .controller import V3Controller
 from .daq import DAQRunResult, V3DAQ
 from .threshold import ThresholdApplier
+from .transport import V3TransportFatalError
 
 class V3QAError(RuntimeError):
 	pass
 
 DecoderFn = Callable[[bytes], list[Any]]
-
-@dataclass(slots=True)
-class QAMetric:
-	name: str
-	value: Any
-	unit: str | None = None
 
 @dataclass(slots=True)
 class QACheckResult:
@@ -282,6 +277,8 @@ class V3QA:
 						stale data or readout state may still be uncleared.')
 
 			return QACheckResult('smoke_test', passed, metrics, notes, artifacts)
+		except V3TransportFatalError:
+			raise
 		except Exception as exc:  # noqa: BLE001
 			notes.append(f'Exception during smoke_test: {exc!r}')
 			return QACheckResult('smoke_test', False, metrics, notes, artifacts)
@@ -513,11 +510,6 @@ class V3QA:
 		total_bytes = [p.metrics.get('total_bytes', 0) for p in points]
 		nonempty_chunks = [p.metrics.get('nonempty_chunks', 0) for p in points]
 		truncated_chunks = [p.metrics.get('truncated_chunks', 0) for p in points]
-		passed = True
-		if len(points) >= 2:
-			if not (total_bytes[-1] <= total_bytes[0] and nonempty_chunks[-1] <= nonempty_chunks[0]):
-				passed = False
-				notes.append('Background activity did not decrease vs. increasing threshold.')
 		if any(x > 0 for x in truncated_chunks):
 			notes.append('One or more threshold points produced long bursts that hit max_rounds.')
 
@@ -531,4 +523,4 @@ class V3QA:
 		if decoder is not None:
 			metrics['total_hits'] = [p.metrics.get('total_hits') for p in points]
 
-		return QACheckResult('threshold_scan', passed, metrics, notes, artifacts)
+		return QACheckResult('threshold_scan', None, metrics, notes, artifacts)

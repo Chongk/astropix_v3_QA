@@ -96,6 +96,8 @@ def build_readout_index(run: DAQRunResult, *, record_size_bytes: int = 11) -> di
 			"rounds": chunk.rounds,
 			"bytes_written_as_dummy": chunk.bytes_written_as_dummy,
 			"buffer_sizes": chunk.buffer_sizes,
+			"truncated": getattr(chunk, "truncated", None),
+			"stop_reason": getattr(chunk, "stop_reason", None),
 		})
 		offset = end
 
@@ -365,10 +367,8 @@ def build_argparser() -> argparse.ArgumentParser:
 	parser.add_argument('-c', '--chipsPerRow', type=int, nargs='+', default=[1])
 	parser.add_argument('-s', '--suffix', type=str, default=None)
 
-	args = parser.parse_args()
-	output_path = str(SCRIPT_DIR / 'data' / time.strftime('%Y%m%d-%H%M%S'))
-	if args.suffix: output_path = f"{output_path}-{args.suffix}"
-	parser.add_argument('-o', '--output-dir', type=str,	default = output_path)
+	default_output = str(SCRIPT_DIR / 'data' / time.strftime('%Y%m%d-%H%M%S'))
+	parser.add_argument('-o', '--output-dir', type=str, default=default_output)
 
 	parser.add_argument('--lane', type=int, default=0)
 	parser.add_argument('--chip', type=int, default=0)
@@ -387,7 +387,8 @@ def build_argparser() -> argparse.ArgumentParser:
 
 	parser.add_argument('--threshold_scan_duration_s', type=float, default=30.0)
 	parser.add_argument('--threshold_scan_offsets_mv', type=float, nargs='+',
-			default=[150, 175, 200, 225, 250, 275, 300])
+			default=[150, 160, 170, 180, 190, 200, 210, 220, 230, 240, 250, 260, 270, 280, 290, 300])
+
 	parser.add_argument('--threshold_mode',	type=str, choices=['internal', 'external_gecco'],
 			default='external_gecco', help='Which threshold path to use')
 
@@ -402,6 +403,8 @@ def build_argparser() -> argparse.ArgumentParser:
 # -----------------------------------------------
 
 def prepare_args(args: argparse.Namespace) -> argparse.Namespace:
+	if getattr(args, 'suffix', None):
+		args.output_dir = f"{args.output_dir}-{args.suffix}"
 	args.fpgaxml = expand_xml_path(args.fpgaxml)
 	args.yaml = expand_yaml_paths(args.yaml)
 	args.chipsPerRow = normalize_chips_per_row(args.chipsPerRow, len(args.yaml))
