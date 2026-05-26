@@ -386,8 +386,9 @@ def build_argparser() -> argparse.ArgumentParser:
 	parser.add_argument('--injector_pulseperset', type=int, default=1)
 
 	parser.add_argument('--threshold_scan_duration_s', type=float, default=30.0)
-	parser.add_argument('--threshold_scan_offsets_mv', type=float, nargs='+',
-			default=[150, 160, 170, 180, 190, 200, 210, 220, 230, 240, 250, 260, 270, 280, 290, 300])
+	parser.add_argument('--threshold_scan_offsets_mv', type=float, nargs='+', default=[180, 200, 220, 240, 260])
+			#default=[150, 160, 170, 180, 190, 200, 210, 220, 230, 240, 250, 260, 270, 280, 290, 300])
+			#default=[200, 210, 220, 230, 240, 250, 260])
 
 	parser.add_argument('--threshold_mode',	type=str, choices=['internal', 'external_gecco'],
 			default='external_gecco', help='Which threshold path to use')

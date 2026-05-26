@@ -1,6 +1,8 @@
 # astropix\_v3\_QA
 Codes for mass chip QA
 
+- May 22, 2026: intermediate cleanup, tested using a v3 chip on carrier
+
 - May 7, 2026: cleanup and minor updates
 
 - May 6, 2026: cpp based decoding and analysis modules added:

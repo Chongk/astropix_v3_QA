@@ -87,6 +87,8 @@ bool ana_03_threshold_scan(const char* path, bool use_readout_index = true, bool
 		c1->cd(4); g_malf->Draw("APL");
 		c1->cd(5); g_ro->Draw("APL");
 		c1->Print(Form("%s/%s.png", fs::path(path).c_str(), c1->GetName()));
+
+		draw_hit(results, use_readout_index, path);
 	}
 	else
 	{

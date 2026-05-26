@@ -1,5 +1,114 @@
 #include "decode.h"
 
+void draw_hit(vector<DecodeResult> results, bool use_readout_index, const char* path)
+{
+	// Populate containers
+	const int files = results.size();
+	TH1F* h1_col[files];
+	TH1F* h1_row[files];
+	TH1F* h1_ts[files];
+	TH1F* h1_tot_us[files];
+	TH1F* h1_fpga_ts[files];
+	for (int a=0; a<files; ++a)
+	{
+		vector<V3Hit> hits = results[a].hits;
+		h1_col[a] = new TH1F(Form("h1_col_%i", a), "column", 40, 0, 40); h1_col[a]->Sumw2();
+		h1_row[a] = new TH1F(Form("h1_row_%i", a), "row", 40, 0, 40); h1_row[a]->Sumw2();
+		h1_ts[a] = new TH1F(Form("h1_ts_%i", a), "timestamp", 300, 0, 300); h1_ts[a]->Sumw2();
+		h1_tot_us[a] = new TH1F(Form("h1_tot_us_%i", a), "", 120, 0, 30); h1_tot_us[a]->Sumw2();
+		h1_tot_us[a]->SetTitle("tot_total * sampleclock * 1.E-3");
+		h1_fpga_ts[a] = new TH1F(Form("h1_fpga_ts_%i", a), "", 250, 0, 5); h1_fpga_ts[a]->Sumw2();
+		h1_fpga_ts[a]->SetTitle("fpga_ts * 1.E-9");
+
+		for (size_t b=0; b<hits.size(); ++b)
+		{
+			const auto& hit = hits[b];
+			hit.isCol ? h1_col[a]->Fill(hit.location) : h1_row[a]->Fill(hit.location);
+			h1_ts[a]->Fill(hit.timestamp);
+			h1_tot_us[a]->Fill(hit.tot_us);
+			h1_fpga_ts[a]->Fill(hit.fpga_ts * 1.E-9);
+		}
+
+		if (use_readout_index)
+		{
+			const double decoded_hits = results[a].stats.decoded_hits;
+			h1_col[a]->Scale(1./decoded_hits);
+			h1_row[a]->Scale(1./decoded_hits);
+			h1_ts[a]->Scale(1./decoded_hits);
+			h1_tot_us[a]->Scale(1./decoded_hits);
+			h1_fpga_ts[a]->Scale(1./decoded_hits);
+		}
+	}//a
+
+	// Set maximum
+	float h1_col_max = 0;
+	float h1_row_max = 0;
+	float h1_ts_max = 0;
+	float h1_tot_us_max = 0;
+	float h1_fpga_ts_max = 0;
+	for (int a=0; a<files; ++a)
+	{
+		if (h1_col[a]->GetMaximum()*1.2 > h1_col_max) h1_col_max = h1_col[a]->GetMaximum()*1.2;
+		if (h1_row[a]->GetMaximum()*1.2 > h1_row_max) h1_row_max = h1_row[a]->GetMaximum()*1.2;
+		if (h1_ts[a]->GetMaximum()*1.2 > h1_ts_max) h1_ts_max = h1_ts[a] ->GetMaximum()*1.2;
+		if (h1_tot_us[a]->GetMaximum()*1.2 > h1_tot_us_max) h1_tot_us_max = h1_tot_us[a]->GetMaximum()*1.2;
+		if (h1_fpga_ts[a]->GetMaximum()*1.2 > h1_fpga_ts_max) h1_fpga_ts_max = h1_fpga_ts[a]->GetMaximum()*1.2;
+	}//a
+
+	// Draw
+	gStyle->SetOptStat(0);
+	const int colors[] = {1, 2, 209, 4, 94, 6, 225};
+	TCanvas* c1 = new TCanvas("c1_hits_info", "", 1600, 900);
+	c1->SetTitle("Decoded hits distributions");
+	c1->Divide(3, 2);
+	for (int a=0; a<files; ++a)
+	{
+		if (a==0)
+		{
+			h1_col[a]->GetYaxis()->SetRangeUser(0, h1_col_max);
+			h1_row[a]->GetYaxis()->SetRangeUser(0, h1_row_max);
+			h1_ts[a]->GetYaxis()->SetRangeUser(0, h1_row_max);
+			h1_tot_us[a]->GetYaxis()->SetRangeUser(0, h1_tot_us_max);
+			h1_fpga_ts[a]->GetYaxis()->SetRangeUser(0, h1_fpga_ts_max);
+		}
+
+		const int idx_col = (a<7) ? a:(a%7);
+
+		c1->cd(1);
+		if (a>7) h1_col[a]->SetFillColor(colors[idx_col]);
+		if (a>7) h1_col[a]->SetFillStyle(a%7+3004);
+		h1_col[a]->SetLineColor(colors[idx_col]);
+		h1_col[a]->DrawCopy(a==0?"hist e":"hist e same");
+
+		c1->cd(2);
+		if (a>7) h1_row[a]->SetFillColor(colors[idx_col]);
+		if (a>7) h1_row[a]->SetFillStyle(a%7+3004);
+		h1_row[a]->SetLineColor(colors[idx_col]);
+		h1_row[a]->DrawCopy(a==0?"hist e":"hist e same");
+
+		c1->cd(3);
+		if (a>7) h1_ts[a]->SetFillColor(colors[idx_col]);
+		if (a>7) h1_ts[a]->SetFillStyle(a%7+3004);
+		h1_ts[a]->SetLineColor(colors[idx_col]);
+		h1_ts[a]->DrawCopy(a==0?"hist e":"hist e same");
+
+		c1->cd(4);
+		if (a>7) h1_tot_us[a]->SetFillColor(colors[idx_col]);
+		if (a>7) h1_tot_us[a]->SetFillStyle(a%7+3004);
+		h1_tot_us[a]->SetLineColor(colors[idx_col]);
+		h1_tot_us[a]->DrawCopy(a==0?"hist e":"hist e same");
+
+		c1->cd(5);
+		if (a>7) h1_fpga_ts[a]->SetFillColor(colors[idx_col]);
+		if (a>7) h1_fpga_ts[a]->SetFillStyle(a%7+3004);
+		h1_fpga_ts[a]->SetLineColor(colors[idx_col]);
+		h1_fpga_ts[a]->DrawCopy(a==0?"hist e":"hist e same");
+	}
+	c1->Print(Form("%s/%s.png", fs::path(path).c_str(), c1->GetName()));
+
+	return;
+}//draw_hit
+
 bool extract_ll_field(const std::string& obj, const std::string& key, long long& value)
 {
     std::regex re("\\\"" + key + "\\\"\\s*:\\s*(-?[0-9]+)");
