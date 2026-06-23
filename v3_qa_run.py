@@ -21,6 +21,7 @@ if str(SCRIPT_DIR) not in sys.path:
 
 from v3.bootstrap import RuntimeBundle, build_runtime_from_files
 from v3.daq import DAQRunResult
+from v3.probe_adapter_runner_integration import add_probe_adapter_args, run_probe_adapter_preflight
 from v3.qa import QACheckResult
 from v3.transport import V3TransportFatalError
 
@@ -250,6 +251,17 @@ async def main(args: argparse.Namespace) -> int:
 		'stack_info': {},
 	}
 
+	adapter_ok = await run_probe_adapter_preflight(
+			args=args,
+			out_dir=out_dir,
+			run_stage=run_stage,
+			session_summary=session_summary,
+	)
+	if not adapter_ok:
+		session_summary["completed_at"] = time.time()
+		write_json(out_dir / "session_summary.json", session_summary)
+		return 0
+
 	runtime: RuntimeBundle | None = None
 	try:
 		logger.info('Bootstrapping board connection via standalone bootstrap module')
@@ -386,7 +398,7 @@ def build_argparser() -> argparse.ArgumentParser:
 	parser.add_argument('--injector_pulseperset', type=int, default=1)
 
 	parser.add_argument('--threshold_scan_duration_s', type=float, default=30.0)
-	parser.add_argument('--threshold_scan_offsets_mv', type=float, nargs='+', default=[180, 200, 220, 240, 260])
+	parser.add_argument('--threshold_scan_offsets_mv', type=float, nargs='+', default=[100, 150, 200, 250])
 			#default=[150, 160, 170, 180, 190, 200, 210, 220, 230, 240, 250, 260, 270, 280, 290, 300])
 			#default=[200, 210, 220, 230, 240, 250, 260])
 
@@ -398,6 +410,8 @@ def build_argparser() -> argparse.ArgumentParser:
 	parser.add_argument('--flush-max-rounds', type=int, default=20)
 	parser.add_argument('--stop-on-fail', action='store_true')
 	parser.add_argument('--loglevel', type=int, default=20)
+
+	add_probe_adapter_args(parser)
 
 	return parser
 
