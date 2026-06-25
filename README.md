@@ -1,6 +1,10 @@
 # astropix\_v3\_QA
 Codes for mass chip QA
 
+- June 25, 2026: separated setup profiles: default, raw\_auto, and raw\_manual
+
+- June 2nd, 2026: integrated adapter card and relevant functions
+
 - May 22, 2026: intermediate cleanup, tested using a v3 chip on carrier
 
 - May 7, 2026: cleanup and minor updates

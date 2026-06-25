@@ -9,6 +9,7 @@ import argparse
 import asyncio
 import json
 import logging
+import signal
 import sys
 import time
 import traceback
@@ -21,7 +22,7 @@ if str(SCRIPT_DIR) not in sys.path:
 
 from v3.bootstrap import RuntimeBundle, build_runtime_from_files
 from v3.daq import DAQRunResult
-from v3.probe_adapter_runner_integration import add_probe_adapter_args, run_probe_adapter_preflight
+from v3.probe_adapter_runner_integration import add_probe_adapter_args, cleanup_probe_adapter_bias, run_probe_adapter_preflight
 from v3.qa import QACheckResult
 from v3.transport import V3TransportFatalError
 
@@ -116,6 +117,8 @@ def build_readout_index(run: DAQRunResult, *, record_size_bytes: int = 11) -> di
 def summarize_run(run: DAQRunResult) -> dict[str, Any]:
 	return {
 		'lanes': run.lanes,
+		'readout_owner': getattr(run, 'readout_owner', 'manual_irq'),
+		'stop_reason': getattr(run, 'stop_reason', None),
 		't_start': run.t_start,
 		't_end': run.t_end,
 		'duration_s': run.t_end - run.t_start,
@@ -139,7 +142,7 @@ def summarize_run(run: DAQRunResult) -> dict[str, Any]:
 		],
 	}
 
-def materialize_artifacts(obj: Any, *, stage_dir: Path, prefix: str) -> Any:
+def materialize_artifacts(obj: Any, *, stage_dir: Path, prefix: str, emit_readout_index: bool = False) -> Any:
 	if isinstance(obj, DAQRunResult):
 		base = stage_dir / prefix
 		raw = flatten_run_raw(obj)
@@ -147,33 +150,36 @@ def materialize_artifacts(obj: Any, *, stage_dir: Path, prefix: str) -> Any:
 		run_json_path = stage_dir / f'{base.name}.json'
 		readout_index_path = stage_dir / f"{base.name}_readout_index.json"
 		bin_path.write_bytes(raw)
-		write_json(run_json_path, summarize_run(obj))
-		write_json(readout_index_path, build_readout_index(obj))
+		run_summary = summarize_run(obj)
+		write_json(run_json_path, run_summary)
 
-		return {
+		payload = {
 			'daq_run_prefix': prefix,
 			'bin_file': bin_path.name,
 			'run_json_file': run_json_path.name,
-			"readout_index_file": readout_index_path.name,
-			'run_summary': summarize_run(obj),
+			'run_summary': run_summary,
 		}
+		if emit_readout_index:
+			write_json(readout_index_path, build_readout_index(obj))
+			payload["readout_index_file"] = readout_index_path.name
+		return payload
 
 	if isinstance(obj, dict):
 		return {
-			key: materialize_artifacts(value, stage_dir=stage_dir, prefix=f'{prefix}_{key}')
+			key: materialize_artifacts(value, stage_dir=stage_dir, prefix=f'{prefix}_{key}', emit_readout_index=emit_readout_index)
 			for key, value in obj.items()
 		}
 
 	if isinstance(obj, list):
 		return [
-			materialize_artifacts(value, stage_dir=stage_dir, prefix=f'{prefix}_{idx:02d}')
+			materialize_artifacts(value, stage_dir=stage_dir, prefix=f'{prefix}_{idx:02d}', emit_readout_index=emit_readout_index)
 			for idx, value in enumerate(obj)
 		]
 
 	return obj
 
-def summarize_check_result(result: QACheckResult, *, stage_dir: Path) -> dict[str, Any]:
-	artifacts = materialize_artifacts(result.artifacts, stage_dir=stage_dir, prefix='out')
+def summarize_check_result(result: QACheckResult, *, stage_dir: Path, emit_readout_index: bool = False) -> dict[str, Any]:
+	artifacts = materialize_artifacts(result.artifacts, stage_dir=stage_dir, prefix='out', emit_readout_index=emit_readout_index)
 	return {
 		'name': result.name,
 		'passed': result.passed,
@@ -189,7 +195,8 @@ async def run_stage(
 		name: str,
 		coro,
 		out_dir: Path,
-		stop_on_fail: bool
+		stop_on_fail: bool,
+		emit_readout_index: bool = False,
 		)	-> tuple[bool, dict[str, Any] | None, bool]:
 	stage_dir = out_dir / name
 	stage_dir.mkdir(parents=True, exist_ok=True)
@@ -199,7 +206,7 @@ async def run_stage(
 	try:
 		result = await coro
 		elapsed = time.time() - t0
-		summary = summarize_check_result(result, stage_dir=stage_dir)
+		summary = summarize_check_result(result, stage_dir=stage_dir, emit_readout_index=emit_readout_index)
 		summary['elapsed_s'] = elapsed
 		write_json(stage_dir / 'result.json', summary)
 		logger.info('=== END %s | passed=%s | elapsed=%.3fs ===', name, result.passed, elapsed)
@@ -238,6 +245,254 @@ async def run_stage(
 		logger.exception('=== FAIL %s | elapsed=%.3fs ===', name, elapsed)
 		return False, error_payload, False
 
+
+
+def write_hex_dump(
+	data: bytes,
+	path: Path,
+	*,
+	bytes_per_line: int = 16,
+	max_bytes: int | None = None,
+) -> dict[str, Any]:
+	"""Write a human-readable hex dump with byte offsets."""
+	ensure_parent(path)
+	bytes_per_line = max(1, int(bytes_per_line))
+	limit = len(data) if max_bytes is None else min(len(data), max(0, int(max_bytes)))
+	with path.open('w', encoding='utf-8') as f:
+		for offset in range(0, limit, bytes_per_line):
+			chunk = data[offset:offset + bytes_per_line]
+			hex_part = ' '.join(f'{b:02x}' for b in chunk)
+			ascii_part = ''.join(chr(b) if 32 <= b < 127 else '.' for b in chunk)
+			f.write(f'{offset:08x}: {hex_part:<{bytes_per_line * 3}} {ascii_part}\n')
+		if limit < len(data):
+			f.write(f'\n# truncated: wrote {limit} of {len(data)} bytes\n')
+	return {
+		'hex_file': path.name,
+		'hex_bytes_written': limit,
+		'hex_total_raw_bytes': len(data),
+		'hex_truncated': limit < len(data),
+		'hex_bytes_per_line': bytes_per_line,
+	}
+
+
+def _install_sigint_stop_event() -> tuple[asyncio.Event, Any]:
+	"""Install a one-shot SIGINT handler that requests clean capture shutdown."""
+	loop = asyncio.get_running_loop()
+	stop_event = asyncio.Event()
+	previous = signal.getsignal(signal.SIGINT)
+
+	def request_stop() -> None:
+		if stop_event.is_set():
+			raise KeyboardInterrupt
+		logger.warning('SIGINT received; stopping raw capture after cleanup. Press Ctrl+C again to abort.')
+		stop_event.set()
+
+	try:
+		loop.add_signal_handler(signal.SIGINT, request_stop)
+		def cleanup() -> None:
+			try:
+				loop.remove_signal_handler(signal.SIGINT)
+			finally:
+				if callable(previous):
+					signal.signal(signal.SIGINT, previous)
+	except NotImplementedError:
+		def handler(signum, frame):  # noqa: ANN001
+			request_stop()
+		signal.signal(signal.SIGINT, handler)
+		def cleanup() -> None:
+			signal.signal(signal.SIGINT, previous)
+
+	return stop_event, cleanup
+
+
+async def configure_raw_debug_chip_state(
+	*,
+	runtime: RuntimeBundle,
+	args: argparse.Namespace,
+) -> dict[str, Any]:
+	"""Configure the chip condition to be observed by raw_debug capture.
+
+	Raw debug mode is not itself a QA routine, but it still needs an explicit
+	chip state.  The default ``as_configured`` state preserves the YAML-loaded
+	configuration.  ``full_matrix_noise`` intentionally reproduces one point of
+	the threshold-scan style background/noise condition: reset matrix, enable all
+	pixels, apply the requested threshold, then capture without injection.
+	"""
+	state = str(args.raw_chip_state)
+	info: dict[str, Any] = {
+		'raw_chip_state': state,
+		'lane': int(args.lane),
+		'chip': int(args.chip),
+		'injection_enabled': False,
+	}
+
+	if state == 'as_configured':
+		info.update({
+			'config_modified_for_raw_debug': False,
+			'threshold_applied': False,
+			'full_matrix_enabled': False,
+		})
+		return info
+
+	if state != 'full_matrix_noise':
+		raise ValueError(f'Unsupported raw chip state: {state!r}')
+
+	# Keep injection routing off for a background/noise raw capture.
+	try:
+		await runtime.controller.route_injection_to_chip(enable=False)
+		info['injection_route_to_chip_disabled'] = True
+	except Exception as exc:  # noqa: BLE001
+		# Some bring-up firmware/driver variants may not expose the injection route.
+		# This is not fatal for a background-only capture, but must be visible.
+		info['injection_route_to_chip_disabled'] = False
+		info['injection_route_disable_error'] = repr(exc)
+
+	enabled_pixels = runtime.qa._enable_full_matrix(lane=args.lane, chip=args.chip)  # noqa: SLF001
+	threshold_mode = args.raw_threshold_mode or args.threshold_mode
+	threshold_mv = float(args.raw_threshold_mv)
+	threshold_apply_mode = await runtime.qa._apply_threshold(  # noqa: SLF001
+		lane=args.lane,
+		chip=args.chip,
+		threshold_offset_mv=threshold_mv,
+		threshold_mode=threshold_mode,
+	)
+
+	info.update({
+		'config_modified_for_raw_debug': True,
+		'full_matrix_enabled': True,
+		'enabled_pixels': enabled_pixels,
+		'threshold_applied': True,
+		'threshold_mode_requested': threshold_mode,
+		'threshold_offset_mv': threshold_mv,
+		'threshold_apply_mode': threshold_apply_mode,
+		'capture_type': 'background_only',
+	})
+	return info
+
+
+async def run_raw_debug_capture_stage(
+	*,
+	runtime: RuntimeBundle,
+	args: argparse.Namespace,
+	out_dir: Path,
+	session_summary: dict[str, Any],
+) -> dict[str, Any]:
+	"""Capture raw bytes without running decoded QA routines."""
+	stage_name = '00_raw_debug_capture'
+	stage_dir = out_dir / stage_name
+	stage_dir.mkdir(parents=True, exist_ok=True)
+	logger.info('=== START %s ===', stage_name)
+	t0 = time.time()
+
+	readout_owner = str(args.readout_owner)
+	autoread = readout_owner == 'fpga_autoread'
+	stop_event, cleanup_sigint = _install_sigint_stop_event()
+	run: DAQRunResult | None = None
+	try:
+		chip_state_info = await configure_raw_debug_chip_state(runtime=runtime, args=args)
+		logger.info('Raw debug chip state: %s', chip_state_info)
+
+		await runtime.daq.prepare_run(
+			lanes=[args.lane],
+			reset_delay_s=args.reset_delay_s,
+			first_chip_id=args.first_chip_id,
+			flush_burst_bytes=args.flush_burst_bytes,
+			flush_max_rounds=args.flush_max_rounds,
+			autoread=autoread,
+		)
+		try:
+			if autoread:
+				run = await runtime.daq.run_for_autoread(
+					duration_s=args.raw_duration_s,
+					lane=args.lane,
+					poll_interval_s=args.raw_buffer_poll_interval_s,
+					max_read_bytes=args.raw_max_read_bytes,
+					stop_event=stop_event,
+				)
+			else:
+				if args.raw_manual_force_clock:
+					run = await runtime.daq.run_for_manual_forced_clock(
+						duration_s=args.raw_duration_s,
+						lane=args.lane,
+						dummy_chunk_bytes=args.raw_dummy_chunk_bytes,
+						poll_interval_s=args.raw_force_clock_period_s,
+						select_each_round=not args.raw_force_clock_hold_csn,
+						max_read_bytes=args.raw_max_read_bytes,
+						stop_event=stop_event,
+					)
+				else:
+					run = await runtime.daq.run_for_manual_irq(
+						duration_s=args.raw_duration_s,
+						lane=args.lane,
+						wait_irq_timeout_s=args.raw_wait_irq_timeout_s,
+						wait_poll_interval_s=args.raw_wait_poll_interval_s,
+						dummy_chunk_bytes=args.raw_dummy_chunk_bytes,
+						trailing_idle_rounds=args.raw_trailing_idle_rounds,
+						max_rounds_per_burst=args.raw_max_rounds_per_burst,
+						read_buffer_each_round=True,
+						stop_event=stop_event,
+					)
+		finally:
+			await runtime.daq.finish_run()
+	finally:
+		cleanup_sigint()
+
+	assert run is not None
+	raw = flatten_run_raw(run)
+	prefix = str(args.raw_output_prefix)
+	bin_path = stage_dir / f'{prefix}.bin'
+	bin_path.write_bytes(raw)
+
+	artifacts: dict[str, Any] = {
+		'bin_file': bin_path.name,
+		'run_summary_file': f'{prefix}.json',
+	}
+	write_json(stage_dir / f'{prefix}.json', summarize_run(run))
+
+	if args.raw_hex_dump:
+		hex_max = args.raw_hex_max_bytes
+		artifacts.update(write_hex_dump(
+			raw,
+			stage_dir / f'{prefix}.hex',
+			bytes_per_line=args.raw_hex_bytes_per_line,
+			max_bytes=hex_max,
+		))
+
+	if readout_owner == 'manual_irq' and args.raw_write_readout_index:
+		idx_path = stage_dir / f'{prefix}_readout_index.json'
+		write_json(idx_path, build_readout_index(run))
+		artifacts['readout_index_file'] = idx_path.name
+
+	elapsed = time.time() - t0
+	metrics = {
+		'mode': 'raw_debug',
+		'setup_profile': args.setup_profile,
+		'readout_owner': readout_owner,
+		'raw_chip_state': chip_state_info,
+		'raw_manual_force_clock': bool(args.raw_manual_force_clock),
+		'requested_duration_s': args.raw_duration_s,
+		'actual_duration_s': run.t_end - run.t_start,
+		'stage_elapsed_s': elapsed,
+		'total_bytes': run.total_bytes,
+		'total_chunks': run.total_chunks,
+		'stop_reason': getattr(run, 'stop_reason', None),
+		'hex_dump_enabled': bool(args.raw_hex_dump),
+		'readout_index_written': 'readout_index_file' in artifacts,
+		'no_decoder_applied': True,
+	}
+	summary = {
+		'name': 'raw_debug_capture',
+		'passed': None,
+		'metrics': metrics,
+		'notes': ['Raw byte-stream capture only; no decoder or QA pass/fail criteria were applied.'],
+		'artifacts': artifacts,
+		'elapsed_s': elapsed,
+	}
+	write_json(stage_dir / 'result.json', summary)
+	logger.info('=== END %s | bytes=%d | elapsed=%.3fs ===', stage_name, run.total_bytes, elapsed)
+	session_summary['stages'][stage_name] = summary
+	return summary
+
 # -----------------------------------------------
 
 async def main(args: argparse.Namespace) -> int:
@@ -247,6 +502,9 @@ async def main(args: argparse.Namespace) -> int:
 	session_summary: dict[str, Any] = {
 		'started_at': time.time(),
 		'argv': vars(args),
+		'setup_profile': args.setup_profile,
+		'run_mode': args.run_mode,
+		'readout_owner': args.readout_owner,
 		'stages': {},
 		'stack_info': {},
 	}
@@ -287,13 +545,25 @@ async def main(args: argparse.Namespace) -> int:
 			write_json(out_dir / f'lane{lane}_config_snapshot.json', cfg.export_all())
 			write_json(out_dir / f'lane{lane}_protocol_order.json', protocol.describe_order(cfg, chip=0))
 
+		if args.run_mode == 'raw_debug':
+			await run_raw_debug_capture_stage(
+				runtime=runtime,
+				args=args,
+				out_dir=out_dir,
+				session_summary=session_summary,
+			)
+			session_summary['completed_at'] = time.time()
+			write_json(out_dir / 'session_summary.json', session_summary)
+			return 0
+
+		qa_autoread = args.readout_owner == 'fpga_autoread'
 		stages = [
 			(
 				'01_smoke_test',
 				qa.smoke_test(
 					lane=args.lane,
 					first_chip_id=args.first_chip_id,
-					autoread=False,
+					autoread=qa_autoread,
 					reset_delay_s=args.reset_delay_s,
 					flush_burst_bytes=args.flush_burst_bytes,
 					flush_max_rounds=args.flush_max_rounds,
@@ -308,7 +578,7 @@ async def main(args: argparse.Namespace) -> int:
 					vinj_mv=args.vinj_mv,
 					injection_thr_mv=args.injection_thr_mv,
 					duration_s=args.injection_duration_s,
-					autoread=False,
+					autoread=qa_autoread,
 					injector_period=args.injector_period,
 					injector_clkdiv=args.injector_clkdiv,
 					injector_initdelay=args.injector_initdelay,
@@ -325,7 +595,7 @@ async def main(args: argparse.Namespace) -> int:
 					threshold_offsets_mv=[float(x) for x in args.threshold_scan_offsets_mv],
 					threshold_mode=args.threshold_mode,
 					duration_s=args.threshold_scan_duration_s,
-					autoread=False,
+					autoread=qa_autoread,
 					enable_full_matrix=True,
 					enable_pixels=None,
 					decoder=None,
@@ -365,6 +635,10 @@ async def main(args: argparse.Namespace) -> int:
 				await runtime.transport.close()
 			except Exception:  # noqa: BLE001
 				logger.exception('Failed while closing board connection')
+		if getattr(args, 'adapter_bias_v', None) is not None and not getattr(args, 'adapter_bias_no_cleanup_on_exit', False):
+			ok = await asyncio.to_thread(cleanup_probe_adapter_bias, args)
+			if not ok:
+				logger.error('Failed to reset adapter bias to zero during session cleanup')
 
 # -----------------------------------------------
 
@@ -378,6 +652,19 @@ def build_argparser() -> argparse.ArgumentParser:
 	parser.add_argument('-y', '--yaml', type=str, nargs='+', default=['singlechip_v3_qa'])
 	parser.add_argument('-c', '--chipsPerRow', type=int, nargs='+', default=[1])
 	parser.add_argument('-s', '--suffix', type=str, default=None)
+
+	parser.add_argument('--setup-profile', type=str,
+		choices=['legacy_carrier', 'adapter_carrier_sim', 'adapter_probe_bare'], default='legacy_carrier',
+		help='Physical setup profile used for metadata and safety checks.',
+	)
+	parser.add_argument('--run-mode', type=str,
+		choices=['qa', 'raw_debug'], default='qa',
+		help='qa runs normal QA routines; raw_debug only captures raw bytes.',
+	)
+	parser.add_argument('--readout-owner', type=str,
+		choices=['fpga_autoread', 'manual_irq'], default='fpga_autoread',
+		help='Readout ownership model. Default QA now uses FPGA autoread.',
+	)
 
 	default_output = str(SCRIPT_DIR / 'data' / time.strftime('%Y%m%d-%H%M%S'))
 	parser.add_argument('-o', '--output-dir', type=str, default=default_output)
@@ -411,6 +698,41 @@ def build_argparser() -> argparse.ArgumentParser:
 	parser.add_argument('--stop-on-fail', action='store_true')
 	parser.add_argument('--loglevel', type=int, default=20)
 
+	# Raw byte-stream debug mode.  If --raw-duration-s is omitted, capture runs
+	# until Ctrl+C requests a clean stop.
+	parser.add_argument('--raw-duration-s', type=float, default=None)
+	parser.add_argument('--raw-output-prefix', type=str, default='raw_debug')
+	parser.add_argument('--raw-chip-state', type=str, choices=['as_configured', 'full_matrix_noise'],
+		default='as_configured',
+		help=('Chip condition for raw_debug capture. as_configured preserves the YAML-loaded state; '
+			'full_matrix_noise resets/enables the full matrix and applies --raw-threshold-mv before capture.'))
+	parser.add_argument('--raw-threshold-mv', type=float, default=200.0,
+		help='Threshold offset used when --raw-chip-state full_matrix_noise is selected.')
+	parser.add_argument('--raw-threshold-mode',	type=str, choices=['internal', 'external_gecco'], default=None,
+		help='Threshold path for raw_debug full_matrix_noise; defaults to --threshold_mode.')
+	parser.add_argument('--raw-buffer-poll-interval-s', type=float, default=0.001)
+	parser.add_argument('--raw-wait-irq-timeout-s', type=float, default=0.01)
+	parser.add_argument('--raw-wait-poll-interval-s', type=float, default=0.0005)
+	parser.add_argument('--raw-dummy-chunk-bytes', type=int, default=32)
+	parser.add_argument('--raw-trailing-idle-rounds', type=int, default=2)
+	parser.add_argument('--raw-max-rounds-per-burst', type=int, default=512)
+	parser.add_argument('--raw-manual-force-clock', action='store_true',
+			help=('In raw_debug + manual_irq, do not wait for IRQ.  Instead, periodically write '
+				'dummy bytes and drain the FPGA buffer.  Useful for low-level line/buffer inspection.'))
+	parser.add_argument('--raw-force-clock-period-s', type=float, default=0.001)
+	parser.add_argument('--raw-force-clock-hold-csn', action='store_true',
+			help='In forced-clock manual raw capture, keep SPI CSN asserted across repeated dummy writes.')
+	parser.add_argument('--raw-max-read-bytes',	type=int, default=None,
+			help='Optional maximum bytes to read per FPGA-buffer drain in raw_debug capture.')
+	parser.add_argument('--raw-write-readout-index', action='store_true', default=True)
+	parser.add_argument('--no-raw-write-readout-index', dest='raw_write_readout_index', action='store_false')
+	parser.add_argument('--raw-hex-dump', action='store_true', default=True)
+	parser.add_argument('--no-raw-hex-dump', dest='raw_hex_dump', action='store_false')
+	parser.add_argument('--raw-hex-bytes-per-line', type=int, default=16)
+	parser.add_argument('--raw-hex-max-bytes', type=int, default=None,
+		help='Maximum raw bytes to include in the human-readable .hex dump; default writes all captured bytes.',
+	)
+
 	add_probe_adapter_args(parser)
 
 	return parser
@@ -429,6 +751,21 @@ def prepare_args(args: argparse.Namespace) -> argparse.Namespace:
 	for y in args.yaml:
 		if not Path(y).exists():
 			raise FileNotFoundError(f'YAML config not found: {y}')
+
+	if args.setup_profile in {'adapter_carrier_sim', 'adapter_probe_bare'} and not args.adapter_ip:
+		raise ValueError(f"setup_profile={args.setup_profile!r} requires --adapter-ip")
+	if args.run_mode == 'raw_debug' and args.raw_duration_s is not None and args.raw_duration_s <= 0:
+		raise ValueError('--raw-duration-s must be positive, or omitted for Ctrl+C-controlled capture')
+	if args.run_mode == 'raw_debug' and args.raw_hex_bytes_per_line <= 0:
+		raise ValueError('--raw-hex-bytes-per-line must be positive')
+	if args.run_mode == 'raw_debug' and args.raw_chip_state == 'full_matrix_noise' and args.raw_threshold_mv is None:
+		raise ValueError('--raw-chip-state full_matrix_noise requires --raw-threshold-mv')
+	if args.run_mode == 'raw_debug' and args.raw_manual_force_clock and args.readout_owner != 'manual_irq':
+		raise ValueError('--raw-manual-force-clock is only valid with --readout-owner manual_irq')
+	if args.run_mode == 'raw_debug' and args.raw_force_clock_period_s <= 0:
+		raise ValueError('--raw-force-clock-period-s must be positive')
+	if args.run_mode == 'raw_debug' and args.raw_max_read_bytes is not None and args.raw_max_read_bytes <= 0:
+		raise ValueError('--raw-max-read-bytes must be positive when provided')
 	return args
 
 def setup_logging(args: argparse.Namespace) -> None:

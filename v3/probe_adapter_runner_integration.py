@@ -32,13 +32,11 @@ Recommended use in v3_qa_run.py
 
 Safety policy
 -------------
-The adapter stages are deliberately run before the existing smoke/injection/
-threshold stages.
+The adapter stages are deliberately run before the existing smoke/injection/threshold stages.
 
-By default, contact failure is a hard gate for later chip QA stages.  This is
-important because the downstream AstroPix-v3 smoke/injection/threshold stages can
-exercise the FPGA/GECCO path and still produce apparent activity even when no
-probe card/chip is present.
+By default, contact failure is a hard gate for later chip QA stages.
+This is important because the downstream AstroPix-v3 smoke/injection/threshold stages can exercise
+the FPGA/GECCO path and still produce apparent activity even when no probe card/chip is present.
 
 For bench tests where the probe card/chip is intentionally absent, use
 `--adapter-contact-nonfatal` or `--adapter-only`.  These options allow the
@@ -63,13 +61,10 @@ try:
 except ImportError:  # pragma: no cover - useful for standalone/local testing
     from probe_adapter import ProbeAdapterClient, ProbeAdapterQA, BiasDacCalibration
 
-
 RunStageFn = Callable[..., Awaitable[tuple[bool, dict[str, Any] | None, bool]]]
-
 
 def _int_auto(value: str) -> int:
     return int(value, 0)
-
 
 def add_probe_adapter_args(parser: argparse.ArgumentParser) -> None:
     """Attach probe-adapter options to the existing v3_qa_run.py parser."""
@@ -79,6 +74,11 @@ def add_probe_adapter_args(parser: argparse.ArgumentParser) -> None:
         type=str,
         default=None,
         help="Enable probe-adapter preflight stages and connect to this IP address.",
+    )
+    group.add_argument(
+        "--disable-adapter",
+        action="store_true",
+        help="Ignore adapter options and skip all adapter preflight stages.",
     )
     group.add_argument("--adapter-port", type=int, default=5000)
     group.add_argument("--adapter-timeout-s", type=float, default=2.0)
@@ -184,6 +184,28 @@ def add_probe_adapter_args(parser: argparse.ArgumentParser) -> None:
     group.add_argument("--adapter-hv-negative-fullscale-v", type=float, default=-500.0)
     group.add_argument("--adapter-hv-fullscale-code", type=int, default=4095)
     group.add_argument(
+        "--adapter-bias-v",
+        type=float,
+        default=None,
+        help="Set and leave this fixed negative adapter bias for subsequent chip QA.",
+    )
+    group.add_argument("--adapter-bias-settle-s", type=float, default=2.0)
+    group.add_argument(
+        "--adapter-bias-no-readback",
+        action="store_true",
+        help="Do not read the HV monitor after setting fixed adapter bias.",
+    )
+    group.add_argument(
+        "--adapter-bias-nonfatal",
+        action="store_true",
+        help="Record fixed-bias failure but skip downstream chip QA as nonfatal.",
+    )
+    group.add_argument(
+        "--adapter-bias-no-cleanup-on-exit",
+        action="store_true",
+        help="Do not reset adapter HV DAC to zero at the end of the session.",
+    )
+    group.add_argument(
         "--adapter-iv-nonfatal",
         action="store_true",
         help=(
@@ -192,7 +214,6 @@ def add_probe_adapter_args(parser: argparse.ArgumentParser) -> None:
         ),
     )
 
-
 def _make_client(args: argparse.Namespace) -> ProbeAdapterClient:
     return ProbeAdapterClient(
         args.adapter_ip,
@@ -200,11 +221,9 @@ def _make_client(args: argparse.Namespace) -> ProbeAdapterClient:
         timeout_s=args.adapter_timeout_s,
     )
 
-
 def _run_echo_stage(args: argparse.Namespace):
     with _make_client(args) as client:
         return ProbeAdapterQA(client).echo_test(value=args.adapter_echo_word)
-
 
 def _run_contact_stage(args: argparse.Namespace):
     with _make_client(args) as client:
@@ -213,7 +232,6 @@ def _run_contact_stage(args: argparse.Namespace):
             cleanup_test_switch=not args.adapter_keep_test_on,
             read_power_monitor=args.adapter_read_power_monitor,
         )
-
 
 def _run_enable_chip_power_stage(args: argparse.Namespace):
     with _make_client(args) as client:
@@ -224,7 +242,6 @@ def _run_enable_chip_power_stage(args: argparse.Namespace):
             test=None,  # preserve TEST; ignore it for pass/fail during chip QA
             read_power_monitor=args.adapter_read_power_monitor,
         )
-
 
 def _run_iv_scan_stage(args: argparse.Namespace):
     bias_cal = BiasDacCalibration(
@@ -244,16 +261,46 @@ def _run_iv_scan_stage(args: argparse.Namespace):
             cleanup_bias=not args.adapter_iv_no_cleanup_bias,
         )
 
+def _run_fixed_bias_stage(args: argparse.Namespace):
+    bias_cal = BiasDacCalibration(
+        mode=args.adapter_hv_calibration_mode,
+        negative_fullscale_v=args.adapter_hv_negative_fullscale_v,
+        code_at_negative_fullscale=args.adapter_hv_fullscale_code,
+    )
+    with _make_client(args) as client:
+        return ProbeAdapterQA(client).set_fixed_bias(
+            bias_v=args.adapter_bias_v,
+            settle_s=args.adapter_bias_settle_s,
+            bias_calibration=bias_cal,
+            read_hv_after=not args.adapter_bias_no_readback,
+        )
+
+def cleanup_probe_adapter_bias(args: argparse.Namespace) -> bool:
+    """Best-effort reset of adapter HV DAC to zero after a fixed-bias session."""
+    if getattr(args, "disable_adapter", False):
+        session_summary.setdefault("adapter_preflight", {})["enabled"] = False
+        session_summary["adapter_preflight"]["disabled_by_user"] = True
+        return True
+    if getattr(args, "adapter_ip", None) is None:
+        return True
+    if getattr(args, "adapter_bias_v", None) is None:
+        return True
+    if getattr(args, "adapter_bias_no_cleanup_on_exit", False):
+        return True
+    try:
+        with _make_client(args) as client:
+            client.set_bias_zero()
+        return True
+    except Exception:
+        return False
 
 async def _run_blocking(fn, *args, **kwargs):  # noqa: ANN001
     return await asyncio.to_thread(fn, *args, **kwargs)
-
 
 async def _adapter_gap(args: argparse.Namespace) -> None:
     delay = max(0.0, float(getattr(args, "adapter_interstage_delay_s", 0.0)))
     if delay > 0:
         await asyncio.sleep(delay)
-
 
 def _mark_chip_qa_skipped(
     session_summary: dict[str, Any],
@@ -265,7 +312,6 @@ def _mark_chip_qa_skipped(
     session_summary["chip_qa_skipped_reason"] = reason
     if aborted:
         session_summary["aborted_reason"] = reason
-
 
 async def run_probe_adapter_preflight(
     *,
@@ -326,6 +372,14 @@ async def run_probe_adapter_preflight(
             "hv_negative_fullscale_v": float(args.adapter_hv_negative_fullscale_v),
             "hv_fullscale_code": int(args.adapter_hv_fullscale_code),
             "cleanup_bias": not bool(args.adapter_iv_no_cleanup_bias),
+        }
+    if getattr(args, "adapter_bias_v", None) is not None:
+        session_summary["adapter_preflight"]["fixed_bias_policy"] = {
+            "enabled": True,
+            "bias_v": float(args.adapter_bias_v),
+            "settle_s": float(args.adapter_bias_settle_s),
+            "hv_calibration_mode": str(args.adapter_hv_calibration_mode),
+            "cleanup_on_exit": not bool(args.adapter_bias_no_cleanup_on_exit),
         }
 
     # Echo is a communication gate.  If it fails, there is no point trying the
@@ -403,8 +457,6 @@ async def run_probe_adapter_preflight(
     else:
         session_summary["adapter_preflight"]["chip_power_enable"] = "skipped_by_user"
 
-    await _adapter_gap(args)
-
     if getattr(args, "adapter_iv_scan", False):
         await _adapter_gap(args)
         ok, payload, transport_fatal = await run_stage(
@@ -423,7 +475,23 @@ async def run_probe_adapter_preflight(
             )
             return False
 
-    await _adapter_gap(args)
+    if getattr(args, "adapter_bias_v", None) is not None:
+        await _adapter_gap(args)
+        ok, payload, transport_fatal = await run_stage(
+            name="0e_adapter_set_fixed_bias",
+            coro=_run_blocking(_run_fixed_bias_stage, args),
+            out_dir=out_dir,
+            stop_on_fail=True,
+        )
+        session_summary["stages"]["0e_adapter_set_fixed_bias"] = payload
+        if transport_fatal or not ok:
+            session_summary["adapter_preflight"]["completed_at"] = time.time()
+            _mark_chip_qa_skipped(
+                session_summary,
+                reason="adapter_fixed_bias_failed",
+                aborted=not bool(getattr(args, "adapter_bias_nonfatal", False)),
+            )
+            return False
 
     session_summary["adapter_preflight"]["completed_at"] = time.time()
     session_summary["chip_qa_skipped"] = False

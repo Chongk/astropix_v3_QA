@@ -138,15 +138,11 @@ class V3QA:
 			)
 		return mode
 
-	def _require_manual_mode(self, autoread: bool) -> None:
-		if autoread:
-			raise V3QAError(
-				'Current QA routines implement the manual IRQ-owned readout path only. '
-				'Firmware autoread is intentionally disabled in this stack.'
-			)
+	@staticmethod
+	def _readout_owner_label(autoread: bool) -> str:
+		return 'fpga_autoread' if autoread else 'manual_irq'
 
 	def _preflight_common(self, *, lane: int, chip: int, autoread: bool) -> None:
-		self._require_manual_mode(autoread)
 		self.controller.get_lane_config(lane)
 		nchips = self.controller.transport.num_chips_on_lane(lane)
 		if not (0 <= chip < nchips):
@@ -252,6 +248,7 @@ class V3QA:
 			metrics['layer_status_before'] = await self.controller.transport.read_layer_status(lane)
 			artifacts['programming_dump'] = self._build_programming_dump(lane=lane, first_chip_id=first_chip_id)
 
+			metrics['readout_owner'] = self._readout_owner_label(autoread)
 			program_result = await self.daq.prepare_run(
 				lanes=[lane],
 				reset_delay_s=reset_delay_s,
@@ -260,7 +257,7 @@ class V3QA:
 				msbfirst=False,
 				flush_burst_bytes=flush_burst_bytes,
 				flush_max_rounds=flush_max_rounds,
-				autoread=False,
+				autoread=autoread,
 			)
 			artifacts['program_result'] = program_result
 
@@ -340,25 +337,33 @@ class V3QA:
 			threshold_mode=threshold_mode,
 		)
 
-		await self.daq.prepare_run(lanes=[lane], autoread=False)
+		await self.daq.prepare_run(lanes=[lane], autoread=autoread)
 		try:
 			await self.controller.start_injection()
-			run = await self.daq.run_for_manual_irq(
-				duration_s=duration_s,
-				lane=lane,
-				wait_irq_timeout_s=0.01,
-				wait_poll_interval_s=0.0005,
-				dummy_chunk_bytes=32,
-				trailing_idle_rounds=2,
-				max_rounds_per_burst=512,
-				read_buffer_each_round=True,
-			)
+			if autoread:
+				run = await self.daq.run_for_autoread(
+					duration_s=duration_s,
+					lane=lane,
+					poll_interval_s=0.001,
+				)
+			else:
+				run = await self.daq.run_for_manual_irq(
+					duration_s=duration_s,
+					lane=lane,
+					wait_irq_timeout_s=0.01,
+					wait_poll_interval_s=0.0005,
+					dummy_chunk_bytes=32,
+					trailing_idle_rounds=2,
+					max_rounds_per_burst=512,
+					read_buffer_each_round=True,
+				)
 		finally:
 			await self.controller.stop_injection()
 			await self.daq.finish_run()
 
 		artifacts['run'] = run
 		metrics = self._summarize_run(run, decoder=decoder, duration_s=duration_s, enabled_pixels=1)
+		metrics['readout_owner'] = self._readout_owner_label(autoread)
 
 		passed = metrics['nonempty_chunks'] > 0
 		if decoder is not None:
@@ -411,7 +416,7 @@ class V3QA:
 				threshold_mode=threshold_mode,
 				vinj_mv=vinj_mv,
 				duration_s=duration_s,
-				autoread=False,
+				autoread=autoread,
 				injector_period=injector_period,
 				injector_clkdiv=injector_clkdiv,
 				injector_initdelay=injector_initdelay,
@@ -438,6 +443,8 @@ class V3QA:
 		if not passed:
 			notes.append('One or more sparse injection points failed.')
 		return QACheckResult('sparse_injection_test', passed, metrics, notes, artifacts)
+
+	# -----------------------------------------------------
 
 	async def threshold_scan(
 		self,
@@ -482,22 +489,30 @@ class V3QA:
 				threshold_mode=threshold_mode,
 			)
 
-			await self.daq.prepare_run(lanes=[lane], autoread=False)
+			await self.daq.prepare_run(lanes=[lane], autoread=autoread)
 			try:
-				run = await self.daq.run_for_manual_irq(
-					duration_s=duration_s,
-					lane=lane,
-					wait_irq_timeout_s=0.01,
-					wait_poll_interval_s=0.0005,
-					dummy_chunk_bytes=32,
-					trailing_idle_rounds=2,
-					max_rounds_per_burst=512,
-					read_buffer_each_round=True,
-				)
+				if autoread:
+					run = await self.daq.run_for_autoread(
+						duration_s=duration_s,
+						lane=lane,
+						poll_interval_s=0.001,
+					)
+				else:
+					run = await self.daq.run_for_manual_irq(
+						duration_s=duration_s,
+						lane=lane,
+						wait_irq_timeout_s=0.01,
+						wait_poll_interval_s=0.0005,
+						dummy_chunk_bytes=32,
+						trailing_idle_rounds=2,
+						max_rounds_per_burst=512,
+						read_buffer_each_round=True,
+					)
 			finally:
 				await self.daq.finish_run()
 
 			summary = self._summarize_run(run, decoder=decoder, duration_s=duration_s, enabled_pixels=enabled_pixels)
+			summary['readout_owner'] = self._readout_owner_label(autoread)
 			summary['enabled_pixels'] = enabled_pixels
 			points.append(QAScanPoint(x=float(thr_mv), metrics=summary))
 			artifacts['thr_scan'].append({
